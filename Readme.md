@@ -33,5 +33,5 @@ fn do_something(len: usize, mem_provider: MemProviderRc<i32>) {
 }
 
 do_something(1000, cache::SizedMemoryPool::new_dynamic_size(1));
-do_something(1000, default_memory_provider!());
+do_something(1000, default_memory_provider!().as_memory_provider());
 ```
