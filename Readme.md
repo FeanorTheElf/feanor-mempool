@@ -5,7 +5,19 @@ Mainly, it defines the trait `MemoryProvider<T>` for objects that can provide ho
 Standard implementations could use basic heap allocation, or for example caching/"recycling" of used memory. 
 This allows making algorithms or structs that require frequent allocations configurable, by giving them a suitable memory provider.
 
-# Example
+## Design rationale
+
+I wanted a simple memory provider library with the following features:
+ - Interchangeability of standard allocations and pooled/cached allocations
+ - Type erasure of the type of the memory pool. 
+   My earlier implementation required every user of a memory provider to be generic with respect to its type, which added (unnecessary ?) complexity to the code.
+ - Memory returned by a memory pool should have a dynamically managed reference to the memory pool (i.e. no lifetime parameter).
+   This requires the use of shared pointers, but leads to much simpler type management.
+
+To summarize, I accept slightly less performant options to achieve points 2 and 3.
+In feanor-math however, the use of large arrays usually goes hand in hand with significant computational cost, so the memory management cost should be negligible.
+
+## Example
 
 ```rust
 use feanor_mempool::*;
