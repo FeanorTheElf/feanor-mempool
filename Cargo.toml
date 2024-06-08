@@ -1,0 +1,25 @@
+[package]
+name = "feanor-mempool"
+version = "1.0.0"
+edition = "2021"
+authors = ["Simon Pohmann <simon@pohmann.de>"]
+
+repository = "https://github.com/FeanorTheElf/feanor-mempool"
+homepage = "https://github.com/FeanorTheElf/feanor-mempool"
+keywords = ["pool", "memory", "allocation"]
+readme = "Readme.md"
+description = "A simple interface to memory allocation and pooling, designed for use by feanor-math."
+license = "MIT"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[lib]
+crate-type = ["rlib"]
+bench = true
+
+[features]
+log_memory = []
+
+[dependencies]
+slice-dst = "1.5.1"
