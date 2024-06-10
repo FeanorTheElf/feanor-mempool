@@ -280,7 +280,22 @@ impl<T, const LEN: usize> LockfreeNonemptyQueue<T, LEN> {
         return result;
     }
 
-    fn drain(&mut self) -> [Option<T>; LEN] {
+    
+    ///
+    /// Empties the queue and returns all elements.
+    /// 
+    /// Requires mutable access, so no synchronization required.
+    /// 
+    pub fn drain(mut self) -> [Option<T>; LEN] {
+        // this is fine, since we drop self afterwards, and do not care about it being in an invalid state
+        unsafe { self.drain_internal() }
+    }
+
+    ///
+    /// Returns all elements of the queue, but leaves the queue in an invalid state;
+    /// Note that dropping self after calling `drain_internal()` is safe.
+    /// 
+    unsafe fn drain_internal(&mut self) -> [Option<T>; LEN] {
         // here we do not worry about synchronization, as we have `&mut self`, thus have exclusive access
         let begin = self.initialized_region.begin();
         let result = std::array::from_fn(|i| {
@@ -385,7 +400,79 @@ impl<T, const LEN: usize> Drop for LockfreeNonemptyQueue<T, LEN> {
 
     fn drop(&mut self) {
         // this will drop the remaining `T`s
-        self.drain();
+        unsafe { self.drain_internal(); }
+    }
+}
+
+///
+/// A lock-free, multi-consumer, multi-producer, fixed size queue.
+/// 
+/// The contract is the same as in [`LockfreeNonemptyQueue`], except
+/// that this queue can be empty.
+/// 
+pub struct LockfreeQueue<T, const MAX_LEN: usize = 8> {
+    base_queue: LockfreeNonemptyQueue<Option<T>>,
+    nondummy_lower_bound: AtomicUsize
+}
+
+impl<T, const MAX_LEN: usize> LockfreeQueue<T, MAX_LEN> {
+
+    ///
+    /// Creates a new, empty queue.
+    /// 
+    pub fn new() -> Self {
+        Self {
+            base_queue: LockfreeNonemptyQueue::new(None),
+            nondummy_lower_bound: AtomicUsize::new(0)
+        }
+    }
+
+    ///
+    /// Empties the queue and returns all elements.
+    /// 
+    /// Requires mutable access, so no synchronization required.
+    /// 
+    pub fn drain(&mut self) -> [Option<T>; MAX_LEN] {
+        let mut it = std::mem::replace(&mut self.base_queue, LockfreeNonemptyQueue::new(None)).drain().into_iter().filter_map(|x| x.flatten()).fuse();
+        std::array::from_fn(|_| it.next())
+    }
+
+    pub fn try_enqueue(&self, el: T) -> Result<(), EnqueueError<T>> {
+        match self.base_queue.try_enqueue(Some(el)) {
+            Ok(()) => {
+                self.nondummy_lower_bound.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            Err(EnqueueError::Full(el)) => Err(EnqueueError::Full(el.unwrap())),
+            Err(EnqueueError::IndexOverflow) => Err(EnqueueError::IndexOverflow)
+        }
+    }
+
+    pub fn try_dequeue(&self) -> Result<T, ()> {
+        let mut current_nondummy_lower_bound = self.nondummy_lower_bound.load(Ordering::SeqCst);
+        if current_nondummy_lower_bound == 0 {
+            return Err(());
+        }
+        while let Err(new) = self.nondummy_lower_bound.compare_exchange_weak(
+            current_nondummy_lower_bound, 
+            current_nondummy_lower_bound - 1, 
+            Ordering::SeqCst, 
+            Ordering::SeqCst
+        ) {
+            current_nondummy_lower_bound = new;
+            if current_nondummy_lower_bound == 0 {
+                return Err(());
+            }
+        }
+        // we are guaranteed to have some non-dummy element in the queue reserved for us,
+        // even though it is not fixed which one
+        loop {
+            match self.base_queue.try_dequeue() {
+                Ok(Some(result)) => { return Ok(result); },
+                Ok(None) => { /* continue */ },
+                Err(()) => { _ = self.base_queue.try_enqueue(None); }
+            }
+        }
     }
 }
 
@@ -393,7 +480,7 @@ impl<T, const LEN: usize> Drop for LockfreeNonemptyQueue<T, LEN> {
 use std::collections::HashSet;
 
 #[test]
-fn test_queue_short() {
+fn test_nonemptyqueue_short() {
     let buffer: LockfreeNonemptyQueue<i32, 3> = LockfreeNonemptyQueue::new(0);
     buffer.try_enqueue(1).unwrap();
     assert_eq!(Err(EnqueueError::Full(2)), buffer.try_enqueue(2));
@@ -402,7 +489,7 @@ fn test_queue_short() {
 }
 
 #[test]
-fn test_queue_basic() {
+fn test_nonemptyqueue_basic() {
     let buffer: LockfreeNonemptyQueue<i32, 9> = LockfreeNonemptyQueue::new(-1);
     assert_eq!(Err(()), buffer.try_dequeue());
     buffer.try_enqueue(0).unwrap();
@@ -428,8 +515,8 @@ fn test_queue_basic() {
 }
 
 #[test]
-fn test_queue_drain() {
-    let mut buffer: LockfreeNonemptyQueue<i32, 9> = LockfreeNonemptyQueue::new(-1);
+fn test_nonemptyqueue_drain() {
+    let buffer: LockfreeNonemptyQueue<i32, 9> = LockfreeNonemptyQueue::new(-1);
     assert_eq!(Err(()), buffer.try_dequeue());
     buffer.try_enqueue(0).unwrap();
     buffer.try_enqueue(1).unwrap();
@@ -449,7 +536,7 @@ fn test_queue_drain() {
 }
 
 #[test]
-fn test_queue_concurrent_state() {
+fn test_nonemptyqueue_concurrent_state() {
     // this state is the result of a thread starting to call `try_dequeue()` on a one-element
     // buffer, but being interrupted before setting the element to `PendingEmpty`
     let buffer = LockfreeNonemptyQueue {
@@ -475,7 +562,7 @@ fn test_queue_concurrent_state() {
 }
 
 #[test]
-fn test_queue_sync() {
+fn test_nonemptyqueue_sync() {
     const THREADS: usize = 64;
     const ELS_PER_THREAD: usize = 8096;
 
@@ -532,7 +619,7 @@ fn test_queue_sync() {
 }
 
 #[test]
-fn test_queue_preserve_order() {
+fn test_nonemptyqueue_preserve_order() {
     const THREADS: usize = 64;
     const ELS_PER_THREAD: usize = 8096;
 
@@ -574,4 +661,59 @@ fn test_queue_preserve_order() {
     assert!(!failed);
     buffer.print();
     buffer.check_state_sync();
+}
+
+#[test]
+fn test_queue_sync() {
+    const THREADS: usize = 64;
+    const ELS_PER_THREAD: usize = 8096;
+
+    let buffer: &'static LockfreeQueue<i32> = Box::leak(Box::new(LockfreeQueue::new()));
+    let counter: &'static AtomicI32 = Box::leak(Box::new(AtomicI32::new(0)));
+
+    let mut join_handles = Vec::new();
+    for _ in 0..THREADS {
+        join_handles.push(std::thread::spawn(|| {
+            let mut dequeued = HashSet::new();
+            let mut failed_enqueued = HashSet::new();
+            for _ in 0..ELS_PER_THREAD {
+                match buffer.try_enqueue(counter.fetch_add(1, Ordering::Relaxed)) {
+                    Ok(()) => {},
+                    Err(EnqueueError::Full(x)) => { assert!(failed_enqueued.insert(x)); },
+                    Err(EnqueueError::IndexOverflow) => { panic!(); }
+                }
+                if let Ok(x) = buffer.try_dequeue() {
+                    assert!(dequeued.insert(x));
+                }
+            }
+            return (dequeued, failed_enqueued);
+        }))
+    }
+    let mut all_els = HashSet::new();
+    
+    let mut failed = false;
+    for handle in join_handles {
+        match handle.join() {
+            Ok((dequeued, failed_enqueued)) => {
+                for x in dequeued {
+                    assert!(all_els.insert(x));
+                }
+                for x in failed_enqueued {
+                    assert!(all_els.insert(x));
+                }
+            },
+            Err(_) => {
+                failed = true;
+            }
+        }
+    }
+    assert!(!failed);
+    
+    while let Ok(x) = buffer.try_dequeue() {
+        assert!(all_els.insert(x));
+    }
+    for i in 0..((THREADS * ELS_PER_THREAD) as i32) {
+        assert!(all_els.contains(&(i as i32)));
+    }
+    assert_eq!(THREADS * ELS_PER_THREAD, all_els.len());
 }
