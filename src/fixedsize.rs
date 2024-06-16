@@ -15,6 +15,9 @@ pub struct FixedLayoutMempool<A: Allocator = Global, const CACHE_SIZE: usize = 8
 
 impl<A: Allocator, const CACHE_SIZE: usize> FixedLayoutMempool<A, CACHE_SIZE> {
 
+    ///
+    /// Creates a new [`FixedLayoutMempool`] that supports allocations with the given layout.
+    /// 
     pub fn new_in(layout: Layout, base_alloc: A) -> Self {
         Self {
             base_alloc: base_alloc,
@@ -23,20 +26,35 @@ impl<A: Allocator, const CACHE_SIZE: usize> FixedLayoutMempool<A, CACHE_SIZE> {
         }
     }
 
+    ///
+    /// Creates a new [`FixedLayoutMempool`] that supports allocations of dynamically sized 
+    /// arrays `[T]` of length `slice_len`.
+    /// 
     pub fn new_for_slice_in<T: Sized>(slice_len: usize, base_alloc: A) -> Self {
         Self::new_in(Layout::array::<T>(slice_len).unwrap(), base_alloc)
+    }
+
+    ///
+    /// Returns the layout supported by this allocator.
+    /// 
+    pub fn supported_layout(&self) -> Layout {
+        self.layout
     }
 }
 
 impl<A: Default + Allocator, const CACHE_SIZE: usize> FixedLayoutMempool<A, CACHE_SIZE> {
+
+    ///
+    /// Creates a new [`FixedLayoutMempool`] that supports allocations with the given layout.
+    /// 
     pub fn new(layout: Layout) -> Self {
-        Self {
-            base_alloc: A::default(),
-            layout: layout,
-            cached_allocs: LockfreeQueue::new()
-        }
+        Self::new_in(layout, A::default())
     }
 
+    ///
+    /// Creates a new [`FixedLayoutMempool`] that supports allocations of dynamically sized 
+    /// arrays `[T]` of length `slice_len`.
+    /// 
     pub fn new_for_slice<T: Sized>(slice_len: usize) -> Self {
         Self::new_in(Layout::array::<T>(slice_len).unwrap(), A::default())
     }
@@ -56,6 +74,11 @@ unsafe impl<A: Allocator, const CACHE_SIZE: usize> Allocator for FixedLayoutMemp
 
     unsafe fn deallocate(&self, mut ptr: NonNull<u8>, layout: Layout) {
         assert!(layout == self.layout);
+        // this statement currently causes UB according to miri (it only occurs once this slice is actually
+        // used again through a reference and not a raw pointer). There currently seems to be no consensus
+        // whether this actually should be UB, and the Rust memory model is still not defined. However,
+        // it is not flagged if we use miri with `miri-tree-borrows`;
+        // for details, see https://github.com/rust-lang/unsafe-code-guidelines/issues/256
         let ptr_as_slice = NonNull::new(std::ptr::slice_from_raw_parts_mut(ptr.as_mut(), self.layout.size())).unwrap();
         match self.cached_allocs.try_enqueue(ptr_as_slice) {
             Ok(()) => {},
