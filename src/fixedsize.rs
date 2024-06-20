@@ -13,6 +13,10 @@ pub struct FixedLayoutMempool<A: Allocator = Global, const CACHE_SIZE: usize = 8
     cached_allocs: LockfreeQueue<NonNull<[u8]>, CACHE_SIZE>
 }
 
+unsafe impl<A: Send + Allocator, const CACHE_SIZE: usize> Send for FixedLayoutMempool<A, CACHE_SIZE> {}
+
+unsafe impl<A: Sync + Allocator, const CACHE_SIZE: usize> Sync for FixedLayoutMempool<A, CACHE_SIZE> {}
+
 impl<A: Allocator, const CACHE_SIZE: usize> FixedLayoutMempool<A, CACHE_SIZE> {
 
     ///
@@ -73,7 +77,7 @@ unsafe impl<A: Allocator, const CACHE_SIZE: usize> Allocator for FixedLayoutMemp
     }
 
     unsafe fn deallocate(&self, mut ptr: NonNull<u8>, layout: Layout) {
-        assert!(layout == self.layout);
+        debug_assert!(layout == self.layout);
         // this statement currently causes UB according to miri (it only occurs once this slice is actually
         // used again through a reference and not a raw pointer). There currently seems to be no consensus
         // whether this actually should be UB, and the Rust memory model is still not defined. However,

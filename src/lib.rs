@@ -6,6 +6,9 @@
 #![feature(btreemap_alloc)]
 #![feature(const_alloc_layout)]
 #![feature(mapped_lock_guards)]
+#![feature(test)]
+
+extern crate test;
 
 use std::alloc::{AllocError, Allocator, Global, Layout};
 use std::ptr::NonNull;
@@ -17,6 +20,10 @@ use std::sync::Arc;
 /// when accessed by multiple threads.
 /// 
 mod lockfree;
+///
+/// Implementation of a Read-delayed-write-lock.
+/// 
+mod delayedlock;
 ///
 /// Implementation of a memory pool supporting only allocations of a fixed layout.
 /// 
@@ -72,4 +79,38 @@ impl<A: Allocator, PtrAlloc: Allocator + Clone> Clone for AllocArc<A, PtrAlloc> 
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
+}
+
+#[cfg(test)]
+use dynsize::DynLayoutMempool;
+#[cfg(test)]
+use std::ptr::Alignment;
+
+#[bench]
+fn bench_multisize_concurrent_allocations(bencher: &mut test::Bencher) {
+    const THREADS: usize = 32;
+    const ALLOCATIONS_LOOPS: usize = 1024;
+    const SIZE1: usize = 1024;
+    const SIZE2: usize = 2048;
+    const SIZE3: usize = 65536;
+
+    let memory_provider: DynLayoutMempool<Global, THREADS> = DynLayoutMempool::new(Alignment::of::<u64>());
+    bencher.iter(|| {
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ALLOCATIONS_LOOPS {
+                        let data1: Vec<u64, _> = Vec::with_capacity_in(SIZE1, &memory_provider);
+                        let data2: Vec<u64, _> = Vec::with_capacity_in(SIZE2, &memory_provider);
+                        let data3: Vec<u64, _> = Vec::with_capacity_in(SIZE1, &memory_provider);
+                        let data4: Vec<u64, _> = Vec::with_capacity_in(SIZE3, &memory_provider);
+                        drop(data1);
+                        drop(data2);
+                        drop(data3);
+                        drop(data4);
+                    }
+                });
+            }
+        });
+    })
 }
