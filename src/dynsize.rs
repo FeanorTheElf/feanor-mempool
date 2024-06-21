@@ -4,7 +4,7 @@ use std::ops::Bound;
 use std::ptr::{Alignment, NonNull};
 use std::cmp::max;
 
-use crate::delayedlock::{MappedReadDelayedWriteLockReadGuard, ReadDelayedWriteLock, SendableNonNull};
+use crate::delayedlock::{MappedReadDelayedWriteLockReadLockGuard, ReadDelayedWriteLock, SendableNonNull};
 use crate::fixedsize::FixedLayoutMempool;
 
 const LAYOUT_HEADER: Layout = Layout::for_value(&Header { size: 0 });
@@ -22,6 +22,7 @@ struct Header {
 pub struct DynLayoutMempool<A: 'static + Allocator + Clone + Send + Sync = Global, const CACHE_SIZE: usize = 8> {
     base_alloc: A,
     alignment: Alignment,
+    max_different_sizes: usize,
     mempools: ReadDelayedWriteLock<BTreeMap<usize, FixedLayoutMempool<A, CACHE_SIZE>, A>>
 }
 
@@ -45,6 +46,7 @@ impl<const CACHE_SIZE: usize> DynLayoutMempool<Global, CACHE_SIZE> {
     pub fn new_global(max_alignment: Alignment) -> Self {
         Self {
             base_alloc: Global,
+            max_different_sizes: usize::MAX,
             // can't use max due to `const fn`
             alignment: if max_alignment.as_usize() > Alignment::of::<usize>().as_usize() { max_alignment } else { Alignment::of::<usize>() },
             mempools: ReadDelayedWriteLock::new(BTreeMap::new_in(Global))
@@ -61,8 +63,33 @@ impl<A: 'static + Allocator + Clone + Send + Sync, const CACHE_SIZE: usize> DynL
     pub fn new_in(max_alignment: Alignment, base_alloc: A) -> Self {
         Self {
             base_alloc: base_alloc.clone(),
+            max_different_sizes: usize::MAX,
             alignment: max(max_alignment, Alignment::of::<usize>()),
             mempools: ReadDelayedWriteLock::new(BTreeMap::new_in(base_alloc))
+        }
+    }
+
+    ///
+    /// Hints to the mempool that allocations of the given layout will be common, and it should
+    /// create a suitable memory pool for these allocations.
+    /// 
+    /// In particular, this will prevent it from over-allocating if allocations of this size are not
+    /// available, but larger ones are.
+    /// 
+    pub fn hint_common_allocation(&self, layout: Layout) {
+        let alloc_layout = self.layout_to_allocate(layout).0;
+        println!("{}", alloc_layout.size());
+        if let Some(_) = self.try_get_allocator_for_exact(alloc_layout.size()) {
+            // entry already exists
+        } else {
+            if self.mempools.read().len() >= self.max_different_sizes {
+                panic!("`DynLayoutMempool` was configured to only allocate data with {} different size, but this was exceeded; It will return AllocError", self.max_different_sizes);
+            }
+            let allocator = self.base_alloc.clone();
+            self.mempools.query_write(move |mempool_tree| {
+                let entry = mempool_tree.entry(alloc_layout.size());
+                entry.or_insert(FixedLayoutMempool::new_in(alloc_layout, allocator));
+            });
         }
     }
 
@@ -74,24 +101,24 @@ impl<A: 'static + Allocator + Clone + Send + Sync, const CACHE_SIZE: usize> DynL
         return (result, offset);
     }
 
-    fn try_get_allocator_for_at_least<'a>(&'a self, size: usize) -> Option<MappedReadDelayedWriteLockReadGuard<'a, BTreeMap<usize, FixedLayoutMempool<A, CACHE_SIZE>, A>, FixedLayoutMempool<A, CACHE_SIZE>>> {
+    fn try_get_allocator_for_at_least<'a>(&'a self, size: usize) -> Option<MappedReadDelayedWriteLockReadLockGuard<'a, BTreeMap<usize, FixedLayoutMempool<A, CACHE_SIZE>, A>, FixedLayoutMempool<A, CACHE_SIZE>>> {
         self.mempools.read().try_map(|locked| {
             if let Some(value) = locked.lower_bound(Bound::Included(&size)).next() {
-                Some(value.1)
+                Ok(value.1)
             } else {
-                None
+                Err(())
             }
-        })
+        }).ok()
     }
 
-    fn try_get_allocator_for_exact<'a>(&'a self, size: usize) -> Option<MappedReadDelayedWriteLockReadGuard<'a, BTreeMap<usize, FixedLayoutMempool<A, CACHE_SIZE>, A>, FixedLayoutMempool<A, CACHE_SIZE>>> {
+    fn try_get_allocator_for_exact<'a>(&'a self, size: usize) -> Option<MappedReadDelayedWriteLockReadLockGuard<'a, BTreeMap<usize, FixedLayoutMempool<A, CACHE_SIZE>, A>, FixedLayoutMempool<A, CACHE_SIZE>>> {
         self.mempools.read().try_map(|locked| {
             if let Some(value) = locked.get(&size) {
-                Some(value)
+                Ok(value)
             } else {
-                None
+                Err(())
             }
-        })
+        }).ok()
     }
 }
 
@@ -106,15 +133,23 @@ unsafe impl<A: 'static + Allocator + Clone + Send + Sync, const CACHE_SIZE: usiz
 
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.align() > self.alignment.as_usize() {
+            if !cfg!(feature = "disable_print_warnings") {
+                eprintln!("Called `DynLayoutMempool` supporting max alignment {} for allocation with min alignment {:?}; It will return AllocError", self.alignment.as_usize(), layout.align());
+            }
             return Err(AllocError);
         }
         let (alloc_layout, offset) = self.layout_to_allocate(layout);
 
         let result = if let Some(allocator) = self.try_get_allocator_for_at_least(alloc_layout.size()) {
-            let result = allocator.allocate(alloc_layout).unwrap();
+            let result = allocator.allocate(allocator.supported_layout()).unwrap();
             debug_assert_eq!(result.len(), allocator.supported_layout().size());
             result
         } else {
+            if self.mempools.read().len() >= self.max_different_sizes {
+                if !cfg!(feature = "disable_print_warnings") {
+                    eprintln!("`DynLayoutMempool` was configured to only allocate data with {} different size, but this was exceeded; It will return AllocError", self.max_different_sizes);
+                }
+            }
             self.base_alloc.allocate(alloc_layout).unwrap()
         };
         unsafe { std::ptr::write(result.as_mut_ptr() as *mut Header, Header { size: result.len() }); }
@@ -137,10 +172,10 @@ unsafe impl<A: 'static + Allocator + Clone + Send + Sync, const CACHE_SIZE: usiz
         } else {
             let allocator = self.base_alloc.clone();
             let sendable_ptr = SendableNonNull::new(ptr);
-            self.mempools.query_write(Box::new(move |mempool_tree| {
+            self.mempools.query_write(move |mempool_tree| {
                 let entry = mempool_tree.entry(header.size);
                 entry.or_insert(FixedLayoutMempool::new_in(actual_layout, allocator)).deallocate(sendable_ptr.extract(), actual_layout);
-            }));
+            });
         }
     }
 }

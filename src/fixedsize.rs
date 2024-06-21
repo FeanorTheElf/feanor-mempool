@@ -68,6 +68,9 @@ unsafe impl<A: Allocator, const CACHE_SIZE: usize> Allocator for FixedLayoutMemp
 
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout != self.layout {
+            if !cfg!(feature = "disable_print_warnings") {
+                eprintln!("Called `FixedLayoutMempool` supporting layout {:?} for layout {:?}; It will return AllocError", self.supported_layout(), layout);
+            }
             return Err(AllocError);
         }
         match self.cached_allocs.try_dequeue() {
@@ -91,7 +94,9 @@ unsafe impl<A: Allocator, const CACHE_SIZE: usize> Allocator for FixedLayoutMemp
             },
             Err(EnqueueError::IndexOverflow) => {
                 self.base_alloc.deallocate(ptr, self.layout);
-                eprintln!("Underlying queue of FixedSizeMempool has exhausted its index space; FixedSizeMempool will stop caching memory now");
+                if !cfg!(feature = "disable_print_warnings") {
+                    eprintln!("Underlying queue of FixedSizeMempool has exhausted its index space; FixedSizeMempool will stop caching memory now");
+                }
             }
         }
     }

@@ -6,6 +6,7 @@
 #![feature(btreemap_alloc)]
 #![feature(const_alloc_layout)]
 #![feature(mapped_lock_guards)]
+#![feature(never_type)]
 #![feature(test)]
 
 extern crate test;
@@ -86,31 +87,127 @@ use dynsize::DynLayoutMempool;
 #[cfg(test)]
 use std::ptr::Alignment;
 
-#[bench]
-fn bench_multisize_concurrent_allocations(bencher: &mut test::Bencher) {
-    const THREADS: usize = 32;
-    const ALLOCATIONS_LOOPS: usize = 1024;
-    const SIZE1: usize = 1024;
-    const SIZE2: usize = 2048;
-    const SIZE3: usize = 65536;
+///
+/// I try to mimic the allocation behavior when performing operations in 
+/// a ring extension. In particular, at the time of writing, the feanor-math
+/// implementation required three differently sized allocations:
+///  - arrays of size `n` for ring elements
+///  - arrays of size `2n` temporarily during multiplication
+///  - arrays of size `n^2` for the matrix during complex operations, in particular division
+/// 
+#[cfg(test)]
+fn mock_use_case_algebra_computations<A: Allocator>(allocator: &A) {
 
-    let memory_provider: DynLayoutMempool<Global, THREADS> = DynLayoutMempool::new(Alignment::of::<u64>());
-    bencher.iter(|| {
-        std::thread::scope(|scope| {
-            for _ in 0..THREADS {
-                scope.spawn(|| {
-                    for _ in 0..ALLOCATIONS_LOOPS {
-                        let data1: Vec<u64, _> = Vec::with_capacity_in(SIZE1, &memory_provider);
-                        let data2: Vec<u64, _> = Vec::with_capacity_in(SIZE2, &memory_provider);
-                        let data3: Vec<u64, _> = Vec::with_capacity_in(SIZE1, &memory_provider);
-                        let data4: Vec<u64, _> = Vec::with_capacity_in(SIZE3, &memory_provider);
-                        drop(data1);
-                        drop(data2);
-                        drop(data3);
-                        drop(data4);
-                    }
-                });
+    fn mimic_convolution<A: Allocator>(lhs: &[i64], rhs: &[i64], dst: &mut Vec<i64, A>) {
+        dst.clear();
+        for i in 0..lhs.len() {
+            std::hint::black_box(lhs[i]);
+        }
+        for i in 0..rhs.len() {
+            std::hint::black_box(rhs[i]);
+        }
+        for _ in 0..(lhs.len() + rhs.len() - 1) {
+            dst.push(std::hint::black_box(0));
+        }
+        dst.push(0);
+    }
+
+    fn mimic_addition<A: Allocator>(lhs: &[i64], rhs: &[i64], dst: &mut Vec<i64, A>) {
+        dst.clear();
+        assert_eq!(lhs.len(), rhs.len());
+        for i in 0..lhs.len() {
+            std::hint::black_box(lhs[i]);
+            std::hint::black_box(rhs[i]);
+            dst.push(std::hint::black_box(0));
+        }
+    }
+
+    fn mimic_matrix<A: Allocator>(x: &[i64], y: &[i64], dst: &mut Vec<i64, A>) {
+        for i in 0..x.len() {
+            for j in 0..y.len() {
+                std::hint::black_box(x[i]);
+                std::hint::black_box(y[j]);
+                dst.push(std::hint::black_box(0));
             }
-        });
-    })
+        }
+    }
+
+    const SIZE: usize = 64;
+    const SIZE2: usize = 2 * SIZE;
+    const SIZE_SQR: usize = SIZE * SIZE;
+    
+    let mut x = Vec::with_capacity_in(SIZE, allocator);
+    x.extend((0..SIZE).map(|n| n as i64));
+    let mut y = Vec::with_capacity_in(SIZE, allocator);
+    y.extend((0..SIZE).map(|n| 2 * n as i64 + 1));
+    // mimic some additions and multiplications, like they would e.g. appear during polynomial
+    // evaluation via Horner's schema
+    for _ in 0..8 {
+        let mut w = Vec::with_capacity_in(SIZE2, allocator);
+        mimic_convolution(&x, &y, &mut w);
+        let mut z = Vec::with_capacity_in(SIZE, allocator);
+        mimic_addition(&w[SIZE..], &w[0..SIZE], &mut z);
+        mimic_addition(&z, &x, &mut y);
+    }
+    let mut matrix = Vec::with_capacity_in(SIZE_SQR, allocator);
+    mimic_matrix(&x, &y, &mut matrix);
+}
+
+#[cfg(test)]
+fn benchmark_dynsize_multithreaded<A: Allocator + Sync>(allocator: &A) {
+
+    const THREADS: usize = 16;
+    const LOOPS: usize = 16;
+
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..LOOPS {
+                    mock_use_case_algebra_computations(&allocator)
+                }
+            });
+        }
+    });
+}
+
+#[bench]
+fn bench_dynsize_multithreaded_mempool(bencher: &mut test::Bencher) {
+    let allocator: DynLayoutMempool<Global> = DynLayoutMempool::new(Alignment::of::<u64>());
+    bencher.iter(|| {
+        benchmark_dynsize_multithreaded(&allocator);
+    });
+}
+
+#[bench]
+fn bench_dynsize_multithreaded_global(bencher: &mut test::Bencher) {
+    let allocator = Global;
+    bencher.iter(|| {
+        benchmark_dynsize_multithreaded(&allocator);
+    });
+}
+
+#[cfg(test)]
+fn benchmark_dynsize_singlethreaded<A: Allocator>(allocator: &A) {
+
+    const LOOPS: usize = 256;
+
+    for _ in 0..LOOPS {
+        mock_use_case_algebra_computations(&allocator)
+    }
+}
+
+#[bench]
+fn bench_dynsize_singlethreaded_mempool(bencher: &mut test::Bencher) {
+    let allocator: DynLayoutMempool<Global> = DynLayoutMempool::new(Alignment::of::<u64>());
+    bencher.iter(|| {
+        benchmark_dynsize_singlethreaded(&allocator);
+    });
+}
+
+#[bench]
+fn bench_dynsize_singlethreaded_global(bencher: &mut test::Bencher) {
+    let allocator = Global;
+    bencher.iter(|| {
+        benchmark_dynsize_singlethreaded(&allocator);
+    });
 }

@@ -1,7 +1,102 @@
-use std::{cell::UnsafeCell, marker::PhantomData, ops::Deref, ptr::NonNull, sync::*};
-use atomic::AtomicUsize;
+use std::cell::UnsafeCell;
+use std::marker::PhantomData;
+use std::ops::Deref;
+use std::ptr::NonNull;
+use std::sync::*;
+use atomic::AtomicI64;
 
 use crate::lockfree::LockfreeQueue;
+
+type PhantomUnsend = PhantomData<MutexGuard<'static, ()>>;
+
+fn atomic_cas_loop<F: FnMut(i64) -> Result<i64, E>, E>(var: &AtomicI64, mut func: F) -> Result<i64, E> {
+    let mut current = var.load(atomic::Ordering::SeqCst);
+    loop {
+        match func(current) {
+            Ok(new_val) => match var.compare_exchange_weak(current, new_val, atomic::Ordering::SeqCst, atomic::Ordering::SeqCst) {
+                Ok(old_value) => { return Ok(old_value); },
+                Err(new_value) => { current = new_value; }
+            },
+            Err(e) => { return Err(e); }
+        }
+    }
+}
+
+///
+/// An optimistic Read-Async-Lock.
+/// 
+/// As opposed to a read-write-lock, this lock can either be read-locked multiple times (meaning
+/// multiple threads read data), or async-locked multiple times (meaning multiple threads access
+/// the locked data using atomic operation). Note that it is UB if some threads normally read data,
+/// while other threads atomically operate on it, so this is prevented by the lock.
+/// 
+struct TryRALock {
+    // negative -> async-locked, positive -> read-locked
+    locks: AtomicI64
+}
+
+struct TryRALockReadLockGuard<'a> {
+    parent: &'a TryRALock,
+    decrement_on_drop: bool,
+    _dont_send: PhantomUnsend
+}
+
+impl<'a> TryRALockReadLockGuard<'a> {
+
+    pub fn release_try_async(mut self) -> Option<TryRALockAsyncLockGuard<'a>> {
+        match self.parent.locks.compare_exchange(1, -1, atomic::Ordering::SeqCst, atomic::Ordering::SeqCst) {
+            Ok(_) => {
+                self.decrement_on_drop = false;
+                Some(TryRALockAsyncLockGuard { parent: self.parent, _dont_send: PhantomData })
+            },
+            Err(_) => None
+        }
+    }
+}
+
+impl<'a> Drop for TryRALockReadLockGuard<'a> {
+    fn drop(&mut self) {
+        if self.decrement_on_drop {
+            let old_val = self.parent.locks.fetch_sub(1, atomic::Ordering::SeqCst);
+            debug_assert!(old_val > 0);
+        }
+    }
+}
+
+struct TryRALockAsyncLockGuard<'a> {
+    parent: &'a TryRALock,
+    _dont_send: PhantomUnsend
+}
+
+impl<'a> Drop for TryRALockAsyncLockGuard<'a> {
+    fn drop(&mut self) {
+        let old_val = self.parent.locks.fetch_add(1, atomic::Ordering::SeqCst);
+        debug_assert!(old_val < 0);
+    }
+}
+
+impl TryRALock {
+
+    fn new() -> Self {
+        Self { locks: AtomicI64::new(0) }
+    }
+
+    fn async_lock<'a>(&'a self) -> Option<TryRALockAsyncLockGuard<'a>> {
+        match atomic_cas_loop(&self.locks, |locked| if locked <= 0 { Ok(locked.checked_sub(1).unwrap()) } else { Err(()) }) {
+            Ok(_) => Some(TryRALockAsyncLockGuard { parent: self, _dont_send: PhantomData }),
+            Err(()) => None
+        }
+    }
+
+    fn read_or_async<'a>(&'a self) -> Result<TryRALockReadLockGuard<'a>, TryRALockAsyncLockGuard<'a>> {
+        let prev = atomic_cas_loop::<_, !>(&self.locks, |locked| if locked >= 0 { Ok(locked.checked_add(1).unwrap()) } else { Ok(locked.checked_sub(1).unwrap()) }).unwrap_or_else(|x| x);
+        if prev >= 0 {
+            Ok(TryRALockReadLockGuard { parent: self, decrement_on_drop: true, _dont_send: PhantomData })
+        } else {
+            Err(TryRALockAsyncLockGuard { parent: self, _dont_send: PhantomData })
+        }
+    }
+}
 
 ///
 /// A read-write lock that tries to "lock" the data on reads in a lock-free way,
@@ -22,157 +117,132 @@ use crate::lockfree::LockfreeQueue;
 /// way anymore.
 /// 
 pub struct ReadDelayedWriteLock<T: Send + Sync> {
-    data: UnsafeCell<T>,
-    data_lock: RwLock<PhantomData<T>>,
-    require_locked: AtomicUsize,
-    current_readers: AtomicUsize,
-    write_tasks: LockfreeQueue<Box<dyn Send + FnOnce(&mut T)>>
+    actual_data: UnsafeCell<T>,
+    // to read, need either an optimistic read lock, or an optimistic async lock + a fallback read lock;
+    // to write, need an optimistic async lock + a fallback write lock
+    optimistic_lock: TryRALock,
+    fallback_lock: RwLock<PhantomData<T>>,
+    delayed_writes: LockfreeQueue<Box<dyn Send + FnOnce(&mut T)>>
 }
 
 impl<T: Send + Sync> ReadDelayedWriteLock<T> {
     
     pub fn new(data: T) -> Self {
         Self {
-            data_lock: RwLock::new(PhantomData),
-            data: UnsafeCell::new(data),
-            require_locked: AtomicUsize::new(0),
-            current_readers: AtomicUsize::new(0),
-            write_tasks: LockfreeQueue::new()
+            optimistic_lock: TryRALock::new(),
+            fallback_lock: RwLock::new(PhantomData),
+            actual_data: UnsafeCell::new(data),
+            delayed_writes: LockfreeQueue::new()
         }
-    }
-}
-
-fn atomic_inc_no_overflow(var: &AtomicUsize) {
-    let mut current = var.load(atomic::Ordering::SeqCst);
-    loop {
-        assert!(current != usize::MAX, "overflow in atomic counter, cannot proceed without risking UB");
-        match var.compare_exchange_weak(current, current + 1, atomic::Ordering::SeqCst, atomic::Ordering::SeqCst) {
-            Ok(_) => { return; },
-            Err(new_value) => { current = new_value; }
-        }
-    }
-}
-
-pub struct ReadDelayedWriteLockReadGuard<'a, T: Send + Sync> {
-    lock: &'a ReadDelayedWriteLock<T>,
-    read_guard: Option<RwLockReadGuard<'a, PhantomData<T>>>
-}
-
-pub struct MappedReadDelayedWriteLockReadGuard<'a, T: Send + Sync, U: Send + Sync> {
-    data: *const U,
-    #[allow(dead_code)]
-    lock: ReadDelayedWriteLockReadGuard<'a, T>
-}
-
-impl<'a, T: Send + Sync> ReadDelayedWriteLockReadGuard<'a, T> {
-
-    pub fn try_map<U, F: for<'b> FnOnce(&'b T) -> Option<&'b U>>(self, func: F) -> Option<MappedReadDelayedWriteLockReadGuard<'a, T, U>>
-        where U: 'a + Send + Sync
-    {
-        let new_data = func(&*self)? as *const U;
-        Some(MappedReadDelayedWriteLockReadGuard {
-            lock: self,
-            data: new_data
-        })
-    }
-}
-
-impl<'a, T: Send + Sync, U: Send + Sync> Deref for MappedReadDelayedWriteLockReadGuard<'a, T, U> {
-
-    type Target = U;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.data }
-    }
-}
-
-impl<'a, T: Send + Sync> Deref for ReadDelayedWriteLockReadGuard<'a, T> {
-
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.lock.data.get() }
-    }
-}
-
-impl<'a, T: Send + Sync> Drop for ReadDelayedWriteLockReadGuard<'a, T> {
-
-    fn drop(&mut self) {
-        let old_current_readers = self.lock.current_readers.fetch_sub(1, atomic::Ordering::SeqCst);
-        if old_current_readers == 0 {
-            self.lock.try_run_tasks();
-        }
-        // Explicitly drop `read_guard`; this is not necessary, but removes the "unused" warning
-        self.read_guard.take();
     }
 }
 
 unsafe impl<T: Send + Sync> Send for ReadDelayedWriteLock<T> {}
-
 unsafe impl<T: Send + Sync> Sync for ReadDelayedWriteLock<T> {}
+    
+enum ReadDelayedWriteLockReadLockGuardCore<'a, T: Send + Sync> {
+    Optimistic(Option<TryRALockReadLockGuard<'a>>, &'a ReadDelayedWriteLock<T>),
+    Fallback(TryRALockAsyncLockGuard<'a>, Option<RwLockReadGuard<'a, PhantomData<T>>>, &'a ReadDelayedWriteLock<T>)
+}
+
+pub struct ReadDelayedWriteLockReadLockGuard<'a, T: Send + Sync> {
+    data: ReadDelayedWriteLockReadLockGuardCore<'a, T>
+}
+
+impl<'a, T: Send + Sync> ReadDelayedWriteLockReadLockGuard<'a, T> {
+
+    pub fn try_map<F: for<'b> FnOnce(&'b T) -> Result<&'b U, E>, U: 'a + Send + Sync, E>(self, func: F) -> Result<MappedReadDelayedWriteLockReadLockGuard<'a, T, U>, E> {
+        let ptr = func(&self).map(|ptr| ptr as *const U);
+        ptr.map(|ptr| MappedReadDelayedWriteLockReadLockGuard { actual_lock: self, data_ptr: ptr as *const U })
+    }
+}
+
+pub struct MappedReadDelayedWriteLockReadLockGuard<'a, T: Send + Sync, U: Send + Sync> {
+    actual_lock: ReadDelayedWriteLockReadLockGuard<'a, T>,
+    data_ptr: *const U
+}
+
+impl<'a, T: Send + Sync, U: Send + Sync> Deref for MappedReadDelayedWriteLockReadLockGuard<'a, T, U> {
+
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        // ensure that parent lock is actually safe to derefence - should not be necessary, but let's be paranoid
+        _ = &*self.actual_lock;
+        // this is now safe, since we have the lock
+        unsafe { &*self.data_ptr }
+    }
+}
+
+impl<'a, T: Send + Sync> Deref for ReadDelayedWriteLockReadLockGuard<'a, T> {
+
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.data {
+            ReadDelayedWriteLockReadLockGuardCore::Optimistic(read_lock, parent) => {
+                assert!(read_lock.is_some());
+                // this is now safe, since we have a valid read-lock combination
+                unsafe { &*parent.actual_data.get() }
+            },
+            ReadDelayedWriteLockReadLockGuardCore::Fallback(_async_lock, read_lock, parent) => {
+                assert!(read_lock.is_some());
+                // this is now safe, since we have a valid read-lock combination
+                unsafe { &*parent.actual_data.get() }
+            }
+        }
+    }
+}
+
+impl<'a, T: Send + Sync> Drop for ReadDelayedWriteLockReadLockGuard<'a, T> {
+
+    fn drop(&mut self) {
+        match &mut self.data {
+            ReadDelayedWriteLockReadLockGuardCore::Optimistic(read_lock, parent) => if let Some(async_lock) = read_lock.take().unwrap().release_try_async() {
+                parent.try_execute_writes(&async_lock)
+            },
+            ReadDelayedWriteLockReadLockGuardCore::Fallback(async_lock, read_lock, parent) => {
+                drop(read_lock.take().unwrap());
+                parent.try_execute_writes(async_lock);
+            }
+        }
+    }
+}
 
 impl<T: Send + Sync> ReadDelayedWriteLock<T> {
 
-    ///
-    /// Returns `true` if it actually managed to acquire a write lock, i.e.
-    /// ran any tasks that were enqued when the function was started.
-    /// 
-    /// Note that if the return value is `true` and a task was enqueued when
-    /// the `try_run_tasks()` was called, this function has been run. However,
-    /// it might have been run by another thread.
-    /// 
-    fn try_run_tasks(&self) -> bool {
-        atomic_inc_no_overflow(&self.require_locked);
-        let mut result = false;
-        if self.current_readers.load(atomic::Ordering::SeqCst) == 0 {
-            self.run_tasks();
-            result = true;
-        }
-        self.require_locked.fetch_sub(1, atomic::Ordering::SeqCst);
-        return result;
-    }
-
-    fn run_tasks(&self) {
-        assert!(self.require_locked.load(atomic::Ordering::SeqCst) > 0);
-        assert!(self.current_readers.load(atomic::Ordering::SeqCst) == 0);
-        let write_guard = self.data_lock.write().unwrap_or_else(|e| e.into_inner());
-        while let Ok(func) = self.write_tasks.try_dequeue() {
-            let data_mut = unsafe { &mut *self.data.get() };
-            func(data_mut);
-        }
-        drop(write_guard)
-    }
-
-    pub fn read<'a>(&'a self) -> ReadDelayedWriteLockReadGuard<'a, T> {
-        atomic_inc_no_overflow(&self.current_readers);
-        if self.require_locked.load(atomic::Ordering::SeqCst) > 0 {
-            let read_guard = self.data_lock.read().unwrap_or_else(|e| e.into_inner());
-            return ReadDelayedWriteLockReadGuard {
-                lock: self,
-                read_guard: Some(read_guard)
-            };
-        } else {
-            return ReadDelayedWriteLockReadGuard {
-                lock: self,
-                read_guard: None
-            };
-        }
-    }
-
-    pub fn query_write(&self, func: Box<dyn Send + FnOnce(&mut T)>) -> bool {
-        atomic_inc_no_overflow(&self.require_locked);
-        let result = if self.current_readers.load(atomic::Ordering::SeqCst) == 0 {
-            let write_guard = self.data_lock.write().unwrap_or_else(|e| e.into_inner());
-            let data_mut = unsafe { &mut *self.data.get() };
-            func(data_mut);
+    fn try_execute_writes(&self, _async_lock: &TryRALockAsyncLockGuard) {
+        if let Some(write_task) = self.delayed_writes.try_dequeue().ok() {
+            let write_guard = self.fallback_lock.write().unwrap_or_else(|poison| poison.into_inner());
+            write_task(unsafe { &mut *self.actual_data.get() });
+            while let Some(write_task) = self.delayed_writes.try_dequeue().ok() {
+                write_task(unsafe { &mut *self.actual_data.get() });
+            }
             drop(write_guard);
-            true
+        }
+    }
+
+    pub fn read<'a>(&'a self) -> ReadDelayedWriteLockReadLockGuard<'a, T> {
+        ReadDelayedWriteLockReadLockGuard {
+            data: match self.optimistic_lock.read_or_async() {
+                Ok(read_lock) => ReadDelayedWriteLockReadLockGuardCore::Optimistic(Some(read_lock), self),
+                Err(async_lock) => ReadDelayedWriteLockReadLockGuardCore::Fallback(async_lock, Some(self.fallback_lock.read().unwrap_or_else(|poison| poison.into_inner())), self)
+            }
+        }
+    }
+
+    pub fn query_write<F: 'static + Send + FnOnce(&mut T)>(&self, func: F) {
+        if let Some(async_lock) = self.optimistic_lock.async_lock() {
+            let write_lock = self.fallback_lock.write().unwrap_or_else(|poison| poison.into_inner());
+            func(unsafe { &mut *self.actual_data.get() });
+            drop(write_lock);
+            drop(async_lock);
         } else {
-            self.write_tasks.try_enqueue(func).ok().unwrap();
-            self.try_run_tasks()
-        };
-        self.require_locked.fetch_sub(1, atomic::Ordering::SeqCst);
-        return result;
+            self.delayed_writes.try_enqueue(Box::new(func)).ok().unwrap();
+            if let Some(async_lock) = self.optimistic_lock.async_lock() {
+                self.try_execute_writes(&async_lock);
+            }
+        }
     }
 }
 

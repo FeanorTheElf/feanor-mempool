@@ -194,8 +194,10 @@ pub enum EnqueueError<T> {
 }
 
 ///
-/// A lock-free, multi-consumer, multi-producer, fixed size queue that always contains
+/// A lock-free, multi-consumer, multi-producer, fixed size queue (?) that always contains
 /// at least one element.
+/// 
+/// Does it really preserve order? not completely sure. I should really write down a formal proof...
 /// 
 /// # External Contract
 /// 
@@ -319,6 +321,9 @@ impl<T, const LEN: usize> LockfreeNonemptyQueue<T, LEN> {
     pub fn try_dequeue(&self) -> Result<T, ()> {
         let mut take_location = self.initialized_region.atomic_dequeue()?;
 
+        // there is slightly dangerous edge case here: Other threads might wrap around the queue, thus
+        // now `take_location` points somewhere in the middle of the initialized region; Nevertheless, this
+        // should still be fine, as other threads will then skip it
         while let Err(_) = self.data_at(take_location).0.compare_exchange(OccupationStatus::Occupied, OccupationStatus::PendingEmpty) {
             // this is quite an edge case; However, it can occur that we get an index, but before
             // we set it to `PendingEmpty`, other threads cause `initialized_section` to wrap around
