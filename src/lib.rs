@@ -17,15 +17,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 ///
-/// Implementation of a lockfree queue that is used by the allocators to recycle allocations
-/// when accessed by multiple threads.
-/// 
-mod lockfree;
-///
-/// Implementation of a Read-delayed-write-lock.
-/// 
-mod delayedlock;
-///
 /// Implementation of a memory pool supporting only allocations of a fixed layout.
 /// 
 pub mod fixedsize;
@@ -82,6 +73,23 @@ impl<A: Allocator, PtrAlloc: Allocator + Clone> Clone for AllocArc<A, PtrAlloc> 
     }
 }
 
+struct SendableNonNull<T: ?Sized> {
+    data: NonNull<T>
+}
+
+impl<T: ?Sized> SendableNonNull<T> {
+
+    unsafe fn new(data: NonNull<T>) -> Self {
+        Self { data }
+    }
+
+    fn extract(self) -> NonNull<T> {
+        self.data
+    }
+}
+
+unsafe impl<T: ?Sized> Send for SendableNonNull<T> {}
+
 #[cfg(test)]
 use dynsize::DynLayoutMempool;
 #[cfg(test)]
@@ -98,6 +106,7 @@ use std::ptr::Alignment;
 #[cfg(test)]
 fn mock_use_case_algebra_computations<A: Allocator>(allocator: &A) {
 
+    #[inline(never)]
     fn mimic_convolution<A: Allocator>(lhs: &[i64], rhs: &[i64], dst: &mut Vec<i64, A>) {
         dst.clear();
         for i in 0..lhs.len() {
@@ -112,6 +121,7 @@ fn mock_use_case_algebra_computations<A: Allocator>(allocator: &A) {
         dst.push(0);
     }
 
+    #[inline(never)]
     fn mimic_addition<A: Allocator>(lhs: &[i64], rhs: &[i64], dst: &mut Vec<i64, A>) {
         dst.clear();
         assert_eq!(lhs.len(), rhs.len());
@@ -122,7 +132,8 @@ fn mock_use_case_algebra_computations<A: Allocator>(allocator: &A) {
         }
     }
 
-    fn mimic_matrix<A: Allocator>(x: &[i64], y: &[i64], dst: &mut Vec<i64, A>) {
+    #[inline(never)]
+    fn mimic_matrix_construction<A: Allocator>(x: &[i64], y: &[i64], dst: &mut Vec<i64, A>) {
         for i in 0..x.len() {
             for j in 0..y.len() {
                 std::hint::black_box(x[i]);
@@ -148,9 +159,11 @@ fn mock_use_case_algebra_computations<A: Allocator>(allocator: &A) {
         let mut z = Vec::with_capacity_in(SIZE, allocator);
         mimic_addition(&w[SIZE..], &w[0..SIZE], &mut z);
         mimic_addition(&z, &x, &mut y);
+        std::hint::black_box(w);
+        std::hint::black_box(z);
     }
     let mut matrix = Vec::with_capacity_in(SIZE_SQR, allocator);
-    mimic_matrix(&x, &y, &mut matrix);
+    mimic_matrix_construction(&x, &y, &mut matrix);
 }
 
 #[cfg(test)]
@@ -172,7 +185,7 @@ fn benchmark_dynsize_multithreaded<A: Allocator + Sync>(allocator: &A) {
 
 #[bench]
 fn bench_dynsize_multithreaded_mempool(bencher: &mut test::Bencher) {
-    let allocator: DynLayoutMempool<Global> = DynLayoutMempool::new(Alignment::of::<u64>());
+    let allocator: DynLayoutMempool = DynLayoutMempool::new_global(Alignment::of::<u64>());
     bencher.iter(|| {
         benchmark_dynsize_multithreaded(&allocator);
     });
@@ -198,7 +211,7 @@ fn benchmark_dynsize_singlethreaded<A: Allocator>(allocator: &A) {
 
 #[bench]
 fn bench_dynsize_singlethreaded_mempool(bencher: &mut test::Bencher) {
-    let allocator: DynLayoutMempool<Global> = DynLayoutMempool::new(Alignment::of::<u64>());
+    let allocator: DynLayoutMempool = DynLayoutMempool::new_global(Alignment::of::<u64>());
     bencher.iter(|| {
         benchmark_dynsize_singlethreaded(&allocator);
     });
